@@ -1,6 +1,22 @@
 {
   "identity": {
     "file_name": "identity.json"
+  },  
+  "mathqa_alpaca": {
+    "file_name": "mathqa_finetune.json",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "mathqa_alpaca_format": {
+    "file_name": "mathqa_finetune_formatted.json",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
   },
   "alpaca_en_demo": {
     "file_name": "alpaca_en_demo.json"
