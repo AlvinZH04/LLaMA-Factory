@@ -4,8 +4,8 @@ from types import MethodType
 from typing import Any, Optional
 
 import torch
-import numpy as np  # Ensure you have numpy for decoding predictions below
-from transformers import Seq2SeqTrainer, TrainerCallback
+import numpy as np  # <- Make sure you have this if you're decoding predictions below
+from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
 from ...extras import logging
@@ -17,34 +17,17 @@ from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 logger = logging.get_logger(__name__)
 
 
-def get_submodule_by_path(module: torch.nn.Module, path: str) -> Optional[torch.nn.Module]:
-    """
-    Given a module and a dot-separated path string, return the submodule if it exists.
-    For example, path="mlp.up_proj" will return module.mlp.up_proj.
-    """
-    try:
-        submodule = module
-        for attr in path.split("."):
-            submodule = getattr(submodule, attr)
-        return submodule
-    except AttributeError:
-        return None
-
-
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE.
 
     This custom trainer is also able to freeze specific neurons during training.
     You can specify a freeze configuration in two ways:
-      1. Directly via a list of pairs in finetuning_args.freeze_neurons_config
-         (e.g. [[layer_idx, neuron_idx], ...]). In this case, it will default to freezing
-         a neuron in the mlp.up_proj submodule of that layer.
-      2. Via a JSON file provided in finetuning_args.freeze_neurons_config_file
-         whose content contains one or more JSON objects with a "neurons" field.
-         Each neuron entry can be either a two-element list as above, or a three-element list
-         where the third element is a dot-separated submodule path (e.g. "mlp.down_proj").
-         For example:
-         {"uuid": "0a6d35b2-1066-4af7-9a82-...", "neurons": [[0, 7345, "mlp.up_proj"], [10, 6464]]}
+      1. Directly via a list of pairs in `finetuning_args.freeze_neurons_config`
+         (e.g. [[layer_idx, neuron_idx], ...]).
+      2. Via a JSON file provided in `finetuning_args.freeze_neurons_config_file`
+         whose content contains one or more JSON objects with a `"neurons"` field.
+         For example, a line in the file might look like:
+         {"uuid": "0a6d35b2-1066-4af7-9a82-...", "neurons": [[0, 7345], [10, 6464], [13, 4681]], ...}
     """
 
     def __init__(
@@ -68,13 +51,32 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if processor is not None:
             self.add_callback(SaveProcessorCallback(processor))
 
+        # Optionally split the training dataset if split_idx is provided in finetuning_args.
+        # The dataset is split into three (roughly equal) parts and the split specified by split_idx is used.
+        if hasattr(self.finetuning_args, "split_idx"):
+            split_idx = self.finetuning_args.split_idx
+            total = len(self.train_dataset)
+            # Compute the sizes for each split (handling any remainder)
+            split_sizes = [total // 3 + (1 if i < total % 3 else 0) for i in range(3)]
+            splits = []
+            start = 0
+            for size in split_sizes:
+                splits.append(self.train_dataset[start : start + size])
+                start += size
+            if not (0 <= split_idx < 3):
+                raise ValueError("split_idx must be 0, 1, or 2.")
+            self.train_dataset = splits[split_idx]
+            logger.info(f"Using split {split_idx} of training dataset (length: {len(self.train_dataset)}).")
+
         # Process freeze-neuron configuration either from a direct list or from a JSON file.
         neuron_pairs = []
 
         # Option 1: Direct configuration
         if hasattr(finetuning_args, "freeze_neurons_config"):
             neuron_pairs.extend(finetuning_args.freeze_neurons_config)
-            # logger.info(f"Loaded direct neuron freeze configuration: {finetuning_args.freeze_neurons_config}")
+            logger.info(
+                f"Loaded direct neuron freeze configuration: {finetuning_args.freeze_neurons_config}"
+            )
 
         # Option 2: Load configuration from a JSON file
         if hasattr(finetuning_args, "freeze_neurons_config_file"):
@@ -90,9 +92,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                                 obj = json.loads(line)
                                 if "neurons" in obj:
                                     neuron_pairs.extend(obj["neurons"])
-                                    # logger.info(f"Loaded neuron freeze configuration from JSON object with uuid {obj.get('uuid', 'unknown')}: {obj['neurons']}")
+                                    logger.info(
+                                        f"Loaded neuron freeze configuration "
+                                        f"from JSON object with uuid {obj.get('uuid', 'unknown')}: {obj['neurons']}"
+                                    )
                                 else:
-                                    logger.warning("JSON object in freeze_neurons_config_file lacks a 'neurons' field.")
+                                    logger.warning(
+                                        "JSON object in freeze_neurons_config_file "
+                                        "lacks a 'neurons' field."
+                                    )
                             except Exception as e:
                                 logger.error(f"Error parsing line in freeze_neurons_config_file: {e}")
                 except Exception as e:
@@ -103,51 +111,34 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # Freeze the specified neurons
         frozen_neurons_count = 0  # Track how many we actually manage to freeze
         if neuron_pairs:
-            # Try to get the layers attribute from self.model.
             if hasattr(self.model, "layers"):
-                model_layers = self.model.layers
-            # Otherwise, check if the model is nested (e.g., LlamaForCausalLM -> LlamaModel -> layers).
-            elif hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-                model_layers = self.model.model.layers
-            else:
-                model_layers = None
-                logger.warning("Model does not have a 'layers' attribute. Neuron freezing skipped.")
-
-            if model_layers is not None:
                 for pair in neuron_pairs:
-                    # Expect pair to be either [layer_idx, neuron_idx] or [layer_idx, neuron_idx, submodule_path]
                     try:
-                        layer_idx = pair[0]
-                        neuron_idx = pair[1]
-                        if len(pair) >= 3:
-                            submodule_path = pair[2]
-                        else:
-                            submodule_path = "mlp.up_proj"  # default target submodule
+                        layer_idx, neuron_idx = pair[0], pair[1]
                     except (IndexError, TypeError):
-                        logger.warning(f"Invalid neuron pair: {pair}. Expected format [layer_idx, neuron_idx, (optional) submodule_path].")
+                        logger.warning(
+                            f"Invalid neuron pair: {pair}. "
+                            f"Expected format [layer_idx, neuron_idx]."
+                        )
                         continue
 
-                    if layer_idx < len(model_layers):
-                        layer = model_layers[layer_idx]
-                        # Retrieve the target submodule inside the layer
-                        target_module = get_submodule_by_path(layer, submodule_path)
-                        if target_module is None:
-                            logger.warning(f"Layer {layer_idx} does not have submodule '{submodule_path}'. Neuron freezing skipped for this pair.")
-                            continue
-                        if not hasattr(target_module, "weight"):
-                            logger.warning(f"Submodule '{submodule_path}' in layer {layer_idx} does not have a 'weight' attribute. Neuron freezing skipped for this pair.")
-                            continue
-
-                        self.freeze_neuron(target_module, neuron_idx)
+                    if layer_idx < len(self.model.layers):
+                        layer = self.model.layers[layer_idx]
+                        self.freeze_neuron(layer, neuron_idx)
                         frozen_neurons_count += 1
-                        # logger.info(f"Freezing neuron {neuron_idx} in {submodule_path} of layer {layer_idx}.")
+                        logger.info(f"Freezing neuron {neuron_idx} in layer {layer_idx}.")
                     else:
-                        logger.warning(f"Layer index {layer_idx} is out of range (model has {len(model_layers)} layers).")
-                logger.info(f"Total neurons frozen: {frozen_neurons_count}")
+                        logger.warning(
+                            f"Layer index {layer_idx} is out of range "
+                            f"(model has {len(self.model.layers)} layers)."
+                        )
+            else:
+                logger.warning(
+                    "Model does not have a 'layers' attribute. Neuron freezing skipped."
+                )
 
-        # If importance data is provided, add a callback that will compute and freeze the top 3 layers after each epoch.
-        if hasattr(finetuning_args, "importance_data"):
-            self.add_callback(FreezeTopLayersCallback())
+            # Finally, log the total number of neurons that we attempted to freeze
+            logger.info(f"Total neurons frozen: {frozen_neurons_count}")
 
         # (Optional) Other callbacks or modifications can be added below.
         if getattr(finetuning_args, "use_badam", False):
@@ -162,6 +153,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         Attaches a backward hook to the given module's weight (and bias if present)
         so that the gradient for the specified neuron (i.e., a row in the weight) is zeroed out.
         """
+
         def weight_hook(grad: torch.Tensor) -> torch.Tensor:
             if neuron_idx < grad.size(0):
                 grad[neuron_idx, :] = 0
@@ -248,48 +240,3 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         ensure_ascii=False
                     ) + "\n"
                 )
-
-
-# Callback to compute important layers and freeze top 3 layers after each epoch.
-class FreezeTopLayersCallback(TrainerCallback):
-    def on_epoch_end(self, args, state, control, **kwargs):
-        trainer: CustomSeq2SeqTrainer = kwargs.get("trainer")
-        if trainer is None:
-            logger.warning("Trainer instance not found in callback; skipping freeze top layers.")
-            return control
-
-        # Retrieve importance data from finetuning_args (should be a list of (question, correct_answer) tuples)
-        # importance_data = getattr(trainer.finetuning_args, "importance_data", None)
-        importance_data = [("What is 2+2? A) 4, B) 6, C) 12, D) 23", "A")]
-        if importance_data is None:
-            logger.info("No importance data provided; skipping freezing of top layers.")
-            return control
-
-        device = trainer.args.device
-        try:
-            top_layers = identify_important_layers(trainer.model, importance_data, trainer.processing_class, device)
-        except Exception as e:
-            logger.error(f"Error computing important layers: {e}")
-            return control
-
-        # Get top 3 layers (assuming the list is sorted in descending order of importance)
-        top_3_layers = top_layers[:3]
-        logger.info(f"Top 3 important layers to freeze for next epoch: {top_3_layers}")
-
-        # Freeze parameters in the top 3 layers
-        if hasattr(trainer.model, "layers"):
-            layers = trainer.model.layers
-        elif hasattr(trainer.model, "model") and hasattr(trainer.model.model, "layers"):
-            layers = trainer.model.model.layers
-        else:
-            logger.warning("Model does not have a 'layers' attribute; cannot freeze top layers.")
-            return control
-
-        for idx in top_3_layers:
-            if idx < len(layers):
-                for param in layers[idx].parameters():
-                    param.requires_grad = False
-                logger.info(f"Layer {idx} frozen for next epoch.")
-            else:
-                logger.warning(f"Layer index {idx} is out of range; skipping.")
-        return control
